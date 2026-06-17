@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Tactical Assistant
 // @namespace    https://github.com/local/openfront-script
-// @version      0.9.3
+// @version      0.9.4
 // @description  OpenFront 战术助手 — 出生/扩张/农场/自动进攻/防御/武器/联盟全自动，中文界面。
 // @license      MIT
 // @match        https://openfront.io/*
@@ -22,7 +22,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.3",
+    version: "0.9.4",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -4097,12 +4097,17 @@
                 return;
               }
               const sock = gameState.state.gameSocket;
-              // Fire saturation atoms first (simultaneously — each is one intent)
-              plan.atomTargets.forEach((atomTile) => {
-                origWsSend.call(sock, JSON.stringify({ type: "intent", intent: { type: "build_unit", unit: UNIT.ATOM_BOMB, tile: atomTile } }));
+              // Stagger 50 ms per intent to avoid server spam-protection.
+              // Atoms first to drain SAM cooldowns, then H-bomb slips through.
+              const intents = [
+                ...plan.atomTargets.map((tile) => ({ type: "build_unit", unit: UNIT.ATOM_BOMB, tile })),
+                { type: "build_unit", unit: UNIT.HYDROGEN_BOMB, tile: plan.hBombTile }
+              ];
+              intents.forEach((intent, i) => {
+                setTimeout(() => {
+                  origWsSend.call(sock, JSON.stringify({ type: "intent", intent }));
+                }, i * 50);
               });
-              // Then the H-bomb at the scored target
-              origWsSend.call(sock, JSON.stringify({ type: "intent", intent: { type: "build_unit", unit: UNIT.HYDROGEN_BOMB, tile: plan.hBombTile } }));
               lastLaunchAt = performance.now();
               logger.info(\`Auto-nuke strike: \${plan.atomTargets.length} atoms + H-bomb -> \${plan.hBombTarget} (\${plan.enemyTilesHit} tiles, \${plan.coveringSams} SAMs covered)\`);
               roundLogger?.record("auto_nuke_strike_sent", {
@@ -6881,7 +6886,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.3",
+    version: "0.9.4",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
