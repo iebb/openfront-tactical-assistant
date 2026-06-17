@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Tactical Assistant
 // @namespace    https://github.com/local/openfront-script
-// @version      0.9.1
+// @version      0.9.2
 // @description  OpenFront 战术助手 — 出生/扩张/农场/自动进攻/防御/武器/联盟全自动，中文界面。
 // @license      MIT
 // @match        https://openfront.io/*
@@ -22,7 +22,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.1",
+    version: "0.9.2",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -86,7 +86,8 @@
     autoAttack: false,
     autoAttackIncludeMark: false,
     autoAttackCooldownMs: 3000,
-    autoAttackAggression: 2
+    autoAttackAggression: 2,
+    autoNukeStrike: false
   });
 
   // src/shared/event-bus.js
@@ -3738,6 +3739,194 @@
     return null;
   }
 
+  // src/page/automation/nuke-planner.js
+  //
+  // SAM/nuke mechanics (from OpenFrontIO src/core):
+  //   SAM range  = 150 - 480/(level+5)   →  L0≈54  L5≈90  L10≈111  max 150
+  //   SAM cooldown = 90 ticks = 9 seconds
+  //   Intercept: SAM fires if it can reach ANY point on the nuke's flight path
+  //              (straight line from silo to target) within its range radius.
+  //   H-bomb blast radius ≈ 50 tiles (Config.ts nukeExplosionRadius)
+  //   Atom bomb blast radius ≈ 15 tiles
+  //   Saturation doctrine: send N atoms simultaneously where N = SAMs covering
+  //   the flight path. All SAMs fire on the first atom; subsequent ones slip
+  //   through during the 90-tick cooldown window.
+  //
+  var SAM_RANGE_CONSERVATIVE = 54;   // Level-0 SAM range (tile units)
+  var SAM_RANGE_UPGRADED     = 100;  // Estimate for upgraded SAMs (L≈7)
+  var SAM_COOLDOWN_TICKS     = 90;   // Ticks before a SAM can fire again
+  var HBOMB_BLAST_RADIUS     = 50;   // Tiles (Config.nukeExplosionRadius for H-bomb)
+  var ATOM_BLAST_RADIUS      = 15;   // Tiles (Config.nukeExplosionRadius for atom)
+  var NUKE_SPEED_TILES_PER_TICK = 5; // Approximate nuke travel speed
+
+  function scanAllEnemySams(gameView, myState, teamDetection) {
+    return scanUnitsByType(gameView, UNIT.SAM_LAUNCHER, myState, teamDetection).filter(
+      (sam) => !sam.isMine && !sam.isAlly && !sam.underConstruction && sam.tile != null && sam.coords != null
+    );
+  }
+
+  // Tile-space distance between two (x,y) coordinate objects.
+  function coordDist(a, b) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  // Distance from point P to the line-segment AB (all in coord space).
+  // Returns the minimum distance and the parameter t ∈ [0,1] along AB.
+  function pointToSegmentDist(px, py, ax, ay, bx, by) {
+    const abx = bx - ax, aby = by - ay;
+    const len2 = abx * abx + aby * aby;
+    if (len2 === 0) return Math.sqrt((px - ax) ** 2 + (py - ay) ** 2);
+    const t = Math.max(0, Math.min(1, ((px - ax) * abx + (py - ay) * aby) / len2));
+    const cx = ax + t * abx;
+    const cy = ay + t * aby;
+    return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2);
+  }
+
+  // For a nuke flying from siloCoords → targetCoords, return the list of enemy SAMs
+  // that can intercept it (i.e. the flight path passes within their range).
+  function samsThatCoverPath(siloCoords, targetCoords, enemySams, samRange) {
+    return enemySams.filter((sam) => {
+      const dist = pointToSegmentDist(
+        sam.coords.x, sam.coords.y,
+        siloCoords.x, siloCoords.y,
+        targetCoords.x, targetCoords.y
+      );
+      return dist <= samRange;
+    });
+  }
+
+  // Count enemy tiles within a circle of given radius centered on targetCoords.
+  // Uses mapData width to convert tile index to (x,y), sampling a grid for speed.
+  function countEnemyTilesInRadius(gameView, targetCoords, radius, myState, teamDetection, mapData) {
+    if (!mapData || !mapData.width) return 0;
+    const width = mapData.width;
+    const height = mapData.height;
+    const cx = targetCoords.x;
+    const cy = targetCoords.y;
+    const r2 = radius * radius;
+    let count = 0;
+    // Sample every 2nd tile in a bounding box for performance
+    const x0 = Math.max(0, Math.floor(cx - radius));
+    const x1 = Math.min(width - 1, Math.ceil(cx + radius));
+    const y0 = Math.max(0, Math.floor(cy - radius));
+    const y1 = Math.min(height - 1, Math.ceil(cy + radius));
+    for (let y = y0; y <= y1; y += 2) {
+      for (let x = x0; x <= x1; x += 2) {
+        const dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy > r2) continue;
+        const tile = y * width + x;
+        const owner = ownerOf(gameView, tile);
+        if (!owner || owner.id === myState.id || owner.id === myState.smallID) continue;
+        if (teamDetection?.isMyTeammate?.(owner.id)) continue;
+        count++;
+      }
+    }
+    return count;
+  }
+
+  // Score a potential H-bomb target tile:
+  //   (+) enemy tiles in blast radius
+  //   (-) SAMs that survive saturation (atoms sent = availableAtoms)
+  //   (+) target tile owned by a high-threat player
+  function scoreHBombTarget(gameView, targetTile, targetCoords, siloCoords, enemySams, threatRankMap, myState, teamDetection, mapData, availableAtoms) {
+    const coveringSams = samsThatCoverPath(siloCoords, targetCoords, enemySams, SAM_RANGE_UPGRADED);
+    // How many SAMs survive after saturation? If we send availableAtoms simultaneously,
+    // each SAM can only fire once during the first burst, so they ALL fire on atom #1..N.
+    // After the burst, all SAMs are on cooldown → H-bomb slips through.
+    // So we only need availableAtoms >= coveringSams.length to guarantee penetration.
+    const saturated = availableAtoms >= coveringSams.length;
+    const survivingSams = saturated ? 0 : coveringSams.length - availableAtoms;
+    if (survivingSams > 0) return null; // can't penetrate, skip
+
+    const owner = ownerOf(gameView, targetTile);
+    if (!owner) return null;
+    const ownerID = owner.id;
+    if (ownerID === myState.id || ownerID === myState.smallID) return null;
+    if (teamDetection?.isMyTeammate?.(ownerID)) return null;
+
+    const enemyTilesHit = countEnemyTilesInRadius(gameView, targetCoords, HBOMB_BLAST_RADIUS, myState, teamDetection, mapData);
+    const threatBonus = threatRankMap.has(ownerID) ? (5 - Math.min(4, threatRankMap.get(ownerID))) * 500 : 0;
+    return {
+      tile: targetTile,
+      coords: targetCoords,
+      ownerID,
+      ownerName: owner.name || ownerID,
+      enemyTilesHit,
+      coveringSams: coveringSams.length,
+      saturated,
+      score: enemyTilesHit + threatBonus
+    };
+  }
+
+  // Find the best H-bomb target for a given silo, accounting for SAM coverage.
+  // Samples the border tiles of the highest-threat enemy within range.
+  function planHBombStrike(gameView, myPlayer, myState, mapData, enemySams, threats, teamDetection, availableAtoms) {
+    return Promise.resolve()
+      .then(() => typeof myPlayer.borderTiles === "function" ? myPlayer.borderTiles() : null)
+      .then((info) => {
+        const borders = info && info.borderTiles;
+        if (!borders || typeof borders.forEach !== "function") return null;
+        // Find our silo coords for flight-path calculation
+        const mySilos = scanUnitsByType(gameView, UNIT.MISSILE_SILO, myState, null).filter((s) => s.isMine && s.coords);
+        if (!mySilos.length) return null;
+        const siloCoords = mySilos[0].coords;
+
+        const threatRankMap = /* @__PURE__ */ new Map();
+        (threats || []).forEach((t, i) => { if (t?.id != null) threatRankMap.set(t.id, i); });
+
+        // Collect candidate enemy tiles from our border + one step in
+        const candidates = [];
+        borders.forEach((borderTile) => {
+          const bNum = Number(borderTile);
+          if (!Number.isFinite(bNum)) return;
+          const nbs = neighborsOf2(bNum, mapData);
+          nbs.forEach((nb) => {
+            const coords = tileCoords(gameView, nb);
+            if (!coords) return;
+            const result = scoreHBombTarget(
+              gameView, nb, coords, siloCoords, enemySams, threatRankMap,
+              myState, teamDetection, mapData, availableAtoms
+            );
+            if (result && result.score > 0) candidates.push(result);
+          });
+        });
+
+        if (!candidates.length) return null;
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0];
+      });
+  }
+
+  // Build a saturation + H-bomb strike plan for a target.
+  // Returns { atomTiles, hBombTile, coveringSams, saturated, score } or null.
+  function buildNukeStrikePlan(gameView, myPlayer, myState, mapData, threats, teamDetection, availableAtoms, availableHBombs) {
+    const enemySams = scanAllEnemySams(gameView, myState, teamDetection);
+    return planHBombStrike(
+      gameView, myPlayer, myState, mapData, enemySams, threats, teamDetection, availableAtoms
+    ).then((best) => {
+      if (!best) return null;
+      return {
+        hBombTile: best.tile,
+        hBombTarget: best.ownerName,
+        hBombTargetID: best.ownerID,
+        enemyTilesHit: best.enemyTilesHit,
+        coveringSams: best.coveringSams,
+        saturated: best.saturated,
+        score: best.score,
+        // Tiles to hit with atoms = the SAMs on the flight path
+        // (aim at the SAM itself to destroy it / force interception waste)
+        atomTargets: best.coveringSams > 0
+          ? scanAllEnemySams(gameView, myState, teamDetection)
+              .filter((s) => !s.isMine && !s.isAlly && s.tile != null)
+              .slice(0, best.coveringSams)
+              .map((s) => s.tile)
+          : []
+      };
+    });
+  }
+
   // src/page/automation/auto-weapons.js
   var SILO_UNIT = UNIT.MISSILE_SILO;
   var SILO_BUILD_COOLDOWN_MS = 15e3;
@@ -3874,7 +4063,58 @@
       const now = performance.now();
       if (now - lastLaunchAt < LAUNCH_COOLDOWN_MS) return setStatus("cooldown", "launch_cooldown");
       if (finiteOrZero(economy.combatSafety) < MIN_COMBAT_SAFETY_LAUNCH) return setStatus("idle", "unsafe_launch");
-      const weapon = chooseAffordableWeapon(gameView, myPlayer, finiteOrZero(myState.gold));
+      const gold = finiteOrZero(myState.gold);
+
+      // SAM-saturation + H-bomb strike planner
+      if (settings.get("autoNukeStrike")) {
+        const hBombCost = getStructureCost(UNIT.HYDROGEN_BOMB, { gameView, player: myPlayer });
+        const atomCost = getStructureCost(UNIT.ATOM_BOMB, { gameView, player: myPlayer });
+        const atomCostVal = atomCost.source === "runtime" ? atomCost.cost : 75e4;
+        const hBombCostVal = hBombCost.source === "runtime" ? hBombCost.cost : 5e6;
+        const canAffordHBomb = gold >= hBombCostVal + hBombCost.reserveGold;
+        if (canAffordHBomb) {
+          // Calculate how many atoms we can afford alongside the H-bomb
+          const goldAfterHBomb = gold - hBombCostVal;
+          const availableAtoms = Math.max(0, Math.floor(goldAfterHBomb / atomCostVal));
+          buildInFlight = true;
+          buildNukeStrikePlan(gameView, myPlayer, myState, mapDataRef.current, threats || [], teamDetection, availableAtoms, 1)
+            .then((plan) => {
+              buildInFlight = false;
+              if (!plan) {
+                logSkip("no_strike_plan");
+                setStatus("idle", "no_strike_plan");
+                return;
+              }
+              const sock = gameState.state.gameSocket;
+              // Fire saturation atoms first (simultaneously — each is one intent)
+              plan.atomTargets.forEach((atomTile) => {
+                origWsSend.call(sock, JSON.stringify({ type: "intent", intent: { type: "build_unit", unit: UNIT.ATOM_BOMB, tile: atomTile } }));
+              });
+              // Then the H-bomb at the scored target
+              origWsSend.call(sock, JSON.stringify({ type: "intent", intent: { type: "build_unit", unit: UNIT.HYDROGEN_BOMB, tile: plan.hBombTile } }));
+              lastLaunchAt = performance.now();
+              logger.info(\`Auto-nuke strike: \${plan.atomTargets.length} atoms + H-bomb -> \${plan.hBombTarget} (\${plan.enemyTilesHit} tiles, \${plan.coveringSams} SAMs covered)\`);
+              roundLogger?.record("auto_nuke_strike_sent", {
+                hBombTile: plan.hBombTile,
+                hBombTargetID: plan.hBombTargetID,
+                hBombTarget: plan.hBombTarget,
+                atomCount: plan.atomTargets.length,
+                atomTiles: plan.atomTargets,
+                enemyTilesHit: plan.enemyTilesHit,
+                coveringSams: plan.coveringSams,
+                score: plan.score
+              });
+              setStatus("sent", \`strike_\${plan.hBombTarget}\`, { unit: UNIT.HYDROGEN_BOMB, target: plan.hBombTarget, atomCount: plan.atomTargets.length });
+            }).catch((error) => {
+              buildInFlight = false;
+              logSkip("strike_plan_failed", { message: String(error?.message || error || "") });
+            });
+          return setStatus("scanning", "strike_scan");
+        }
+      }
+
+      // Fallback: single-weapon launch as before
+      const weapon = chooseAffordableWeapon(gameView, myPlayer, gold);
       if (!weapon) {
         logSkip("no_affordable_weapon");
         return setStatus("idle", "no_affordable_weapon");
@@ -5661,6 +5901,7 @@
       \${toggle("自动防御", "autoDefense", settings.get("autoDefense"), true)}
       \${toggle("自动登船", "autoBoat", settings.get("autoBoat"), true)}
       \${toggle("自动武器", "autoWeapons", settings.get("autoWeapons"), true)}
+      \${toggle("饱和核打击", "autoNukeStrike", settings.get("autoNukeStrike"), true)}
       \${toggle("攻击标记", "showAttackBadges", settings.get("showAttackBadges"))}
     </div>
     <div class="ofat-hud-actions">
@@ -5837,7 +6078,10 @@
     }
     html += actionPill("防御", defenseSummary(status.autoDefense), status.autoDefense?.emergency ? "warn" : toneFromStatus(status.autoDefense));
     if (settings.get("autoBoat")) html += actionPill("登船", summarizeStatus(status.autoBoat, "空闲"), toneFromStatus(status.autoBoat));
-    if (settings.get("autoWeapons")) html += actionPill("武器", weaponsSummary(status.autoWeapons), toneFromStatus(status.autoWeapons));
+    if (settings.get("autoWeapons")) {
+      const wLabel = settings.get("autoNukeStrike") ? "⚛饱和" : "武器";
+      html += actionPill(wLabel, weaponsSummary(status.autoWeapons), toneFromStatus(status.autoWeapons));
+    }
     html += actionPill("团队", support ? \`\${support.name} \${Math.round(support.troops || 0)}\` : summarizeStatus(status.autoTeamSupport, "空闲"), support ? "ready" : toneFromStatus(status.autoTeamSupport));
     html += actionPill("求救", summarizeStatus(status.quickChat, "空闲"), toneFromStatus(status.quickChat));
     html += actionPill("威胁", threat, threat === "安全" ? "ok" : "warn");
@@ -6612,7 +6856,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.1",
+    version: "0.9.2",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -6676,7 +6920,8 @@
     autoAttack: false,
     autoAttackIncludeMark: false,
     autoAttackCooldownMs: 3000,
-    autoAttackAggression: 2
+    autoAttackAggression: 2,
+    autoNukeStrike: false
   });
 
   // src/settings/settings-store.js
@@ -7127,6 +7372,7 @@
     registerToggleMenu("切换 自动登船", "autoBoat", settings, syncContext);
     registerToggleMenu("切换 自动武器", "autoWeapons", settings, syncContext);
     registerToggleMenu("切换 提前核弹(代替SAM)", "autoWeaponsEarlyNuke", settings, syncContext);
+    registerToggleMenu("切换 SAM饱和+H弹打击", "autoNukeStrike", settings, syncContext);
     registerToggleMenu("切换 自动结盟", "autoAlliance", settings, syncContext);
     registerToggleMenu("切换 智能进攻比例", "smartAttack", settings, syncContext);
     registerToggleMenu("切换 攻击标记", "showAttackBadges", settings, syncContext);
