@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Tactical Assistant
 // @namespace    https://github.com/local/openfront-script
-// @version      0.9.0
+// @version      0.9.1
 // @description  OpenFront 战术助手 — 出生/扩张/农场/自动进攻/防御/武器/联盟全自动，中文界面。
 // @license      MIT
 // @match        https://openfront.io/*
@@ -22,7 +22,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.0",
+    version: "0.9.1",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -85,7 +85,8 @@
     autoExpand: true,
     autoAttack: false,
     autoAttackIncludeMark: false,
-    autoAttackCooldownMs: 3000
+    autoAttackCooldownMs: 3000,
+    autoAttackAggression: 2
   });
 
   // src/shared/event-bus.js
@@ -2463,21 +2464,30 @@
 
   // src/page/automation/auto-attack.js
   //
-  // Target-selection principles (from OpenFront source mechanics):
-  //   - Efficient conquest requires attacker troops >= 2.5x defender effective troops
-  //     (strengthRatio <= 0.40). Below that threshold attacker losses scale linearly up.
-  //   - effectiveTargetTroops already excludes troops the target has committed to other
-  //     attacks, so that value reflects the actual defensive strength we face.
-  //   - Defense Posts within 30 tiles of a border multiply attacker loss x5 and slow
-  //     attack speed x3. We avoid targets whose reserveAfterRatio is dangerously thin
-  //     (proxy: desiredTroops > maxSend means they cost too much relative to our budget).
-  //   - Only fire when economy is in safePush state so we never drain below growth floor.
-  //   - Prefer targets with the lowest strengthRatio (most overwhelmed) first.
-  //
-  // "target" status in farmRecommendations = human player weak enough that the advisor
-  // considers an attack worthwhile. We add a hard strengthRatio guard on top.
-  var AUTO_ATTACK_MAX_STRENGTH_RATIO = 0.40; // 2.5x advantage = max conquest efficiency
-  var AUTO_ATTACK_CAPTURE_TURNS_LIMIT = 3;   // don't start a fight that takes >3 waves
+  // Aggression levels (1-5) map to real combat formula thresholds from the OpenFront source:
+  //   strengthRatio = effectiveTargetTroops / myTroops
+  //   At ratio 0.40 (2.5×) conquest speed reaches its cap — below is the safe zone.
+  //   At ratio 0.95 (≈equal forces) losses scale to maximum — high risk.
+  //   Defense Posts (×5 attacker loss) are partially screened by captureMaxSend budget check.
+  var AGGRESSION_PROFILES = [
+    // level 1 — 稳健: only attack overwhelmingly weak targets, require full economy health
+    { label: "稳健", maxRatio: 0.35, maxTurns: 2, requireSafePush: true,  cooldownMult: 1.5, perTargetMult: 4.0 },
+    // level 2 — 均衡: standard 2.5× threshold, require safePush
+    { label: "均衡", maxRatio: 0.45, maxTurns: 3, requireSafePush: true,  cooldownMult: 1.0, perTargetMult: 3.0 },
+    // level 3 — 进取: 1.67× threshold, tolerate non-critical economy
+    { label: "进取", maxRatio: 0.62, maxTurns: 4, requireSafePush: false, cooldownMult: 0.8, perTargetMult: 2.5 },
+    // level 4 — 强攻: 1.33× threshold, ignore economy state, fast tempo
+    { label: "强攻", maxRatio: 0.78, maxTurns: 5, requireSafePush: false, cooldownMult: 0.55, perTargetMult: 2.0 },
+    // level 5 — 全力: near-equal forces allowed, maximum attack rate — high risk
+    { label: "全力", maxRatio: 0.95, maxTurns: 8, requireSafePush: false, cooldownMult: 0.35, perTargetMult: 1.5 },
+  ];
+  function getAggressionProfile(settings) {
+    const level = Math.max(1, Math.min(5, Number(settings.get("autoAttackAggression")) || 2));
+    return AGGRESSION_PROFILES[level - 1];
+  }
+  function getAggressionLabel(settings) {
+    return getAggressionProfile(settings).label;
+  }
 
   function createAutoAttack({ gameState, OrigWS, origWsSend, settings, logger, roundLogger, teamDetection, getTroopEconomy }) {
     const targetCooldowns = /* @__PURE__ */ new Map();
@@ -2505,60 +2515,71 @@
         const myState = gameState.getMyState();
         if (!myState || !myState.isAlive) return setStatus("idle", "not_alive");
 
-        // Never attack while in economic recovery — growth floor matters more.
+        const profile = getAggressionProfile(settings);
         const economy = getTroopEconomy?.();
-        if (!economy?.safePush) {
-          logSkip("not_safe_push");
+
+        // Economy gate: at low aggression levels require safe push health
+        if (profile.requireSafePush && !economy?.safePush) {
+          logSkip("economy_not_ready");
           return setStatus("blocked", "economy");
         }
-        if (expansion && (expansion.level === "stop" || expansion.level === "recover")) {
-          logSkip("expansion_" + expansion.level);
-          return setStatus("blocked", expansion.level);
+        // At any level never attack when economy is in critical collapse
+        if (economy?.state === "CRITICAL" || economy?.state === "RECOVER") {
+          if (profile.maxRatio < 0.70) {
+            logSkip("economy_critical");
+            return setStatus("blocked", "economy_critical");
+          }
+        }
+        // Respect hard stop from expansion advisor (troops dangerously low)
+        if (profile.maxRatio < 0.70 && expansion && expansion.level === "stop") {
+          logSkip("expansion_stop");
+          return setStatus("blocked", "stop");
         }
 
-        // Pick best target: "target"-status human with strongest economy advantage.
-        // Sorted by ascending strengthRatio so we hit the most-overwhelmed target first.
+        // Build candidate list: "target" (human) or "farm" (AI/nation), sorted weakest-first
         const candidates = (recommendations || [])
           .filter((c) => {
             if (!c || c.suggestedTroops <= 0) return false;
             if (teamDetection?.isMyTeammate?.(c.id)) return false;
             if (c.status !== "target" && c.status !== "farm") return false;
-            // Hard ratio gate: we need >= 2.5x their effective troops.
-            if ((c.strengthRatio || 1) > AUTO_ATTACK_MAX_STRENGTH_RATIO) return false;
-            // Must be able to send enough troops to capture efficiently.
+            // Aggression-level ratio gate
+            if ((c.strengthRatio || 1) > profile.maxRatio) return false;
+            // Budget gate: if we can't send enough troops, defense posts likely make it too costly
             if (c.suggestedTroops > c.captureMaxSend) return false;
-            // Skip if estimated turns are too high (costly multi-wave grind).
-            if ((c.estimatedCaptureTurns || 99) > AUTO_ATTACK_CAPTURE_TURNS_LIMIT) return false;
+            // Capture speed gate: avoid drawn-out multi-wave fights unless very aggressive
+            if ((c.estimatedCaptureTurns || 99) > profile.maxTurns) return false;
             return true;
           })
           .sort((a, b) => (a.strengthRatio || 1) - (b.strengthRatio || 1));
 
-        const target = candidates[0] || null;
-        if (!target) {
+        if (!candidates.length) {
           logSkip("no_qualified_target");
           return setStatus("blocked", "no_target");
         }
 
         const now = performance.now();
         const baseCooldown = Number(settings.get("autoAttackCooldownMs")) || 3e3;
-        // Accelerate slightly when economy is hot (CAP_WASTE = troops over cap = must spend).
-        const cooldownMs = economy.state === "CAP_WASTE" ? Math.max(1e3, baseCooldown * 0.5) : baseCooldown;
+        // CAP_WASTE = troops at/over cap, spend them fast regardless of aggression
+        const wasteMult = economy?.state === "CAP_WASTE" ? 0.4 : 1;
+        const cooldownMs = Math.max(600, baseCooldown * profile.cooldownMult * wasteMult);
+        const perTargetCooldownMs = cooldownMs * profile.perTargetMult;
 
         if (now - lastSentAt < cooldownMs) {
           return setStatus("cooldown", "cooldown", { cooldownMs: Math.round(cooldownMs - (now - lastSentAt)) });
         }
-        const lastTargetSentAt = targetCooldowns.get(target.id) || 0;
-        // Per-target cooldown: wait at least 3 full cycles before hitting same player again.
-        if (now - lastTargetSentAt < cooldownMs * 3) {
-          // Try the next-best candidate if the top one is on cooldown.
-          const alt = candidates.find((c) => (now - (targetCooldowns.get(c.id) || 0)) >= cooldownMs * 3);
-          if (!alt) return setStatus("cooldown", "target_cooldown", { targetName: target.name || target.id });
-          return sendAttack(alt, now);
+
+        // Pick the best non-cooled-down candidate
+        const target = candidates.find((c) => (now - (targetCooldowns.get(c.id) || 0)) >= perTargetCooldownMs)
+          || candidates[0]; // fallback: pick best even if on cooldown (will rotate next tick)
+
+        if (now - (targetCooldowns.get(target.id) || 0) < perTargetCooldownMs) {
+          return setStatus("cooldown", "target_cooldown", { targetName: target.name || target.id });
         }
-        return sendAttack(target, now);
+
+        return sendAttack(target, now, profile);
       }
     };
-    function sendAttack(target, now) {
+    function sendAttack(target, now, profile) {
       const troops = Math.max(1, Math.floor(target.suggestedTroops));
       origWsSend.call(
         gameState.state.gameSocket,
@@ -2566,7 +2587,7 @@
       );
       lastSentAt = now;
       targetCooldowns.set(target.id, now);
-      logger.info(\`Auto-attack \${target.name || target.id}: \${troops} troops (ratio \${(target.strengthRatio || 0).toFixed(2)})\`);
+      logger.info(\`Auto-attack [Lv\${getAggressionProfile(settings).label}] \${target.name || target.id}: \${troops} (ratio \${(target.strengthRatio || 0).toFixed(2)})\`);
       roundLogger?.record("auto_attack_sent", {
         targetID: target.id,
         targetName: target.name || target.id,
@@ -2575,7 +2596,8 @@
         troops,
         suggestedPercent: target.suggestedPercent,
         strengthRatio: target.strengthRatio,
-        estimatedCaptureTurns: target.estimatedCaptureTurns
+        estimatedCaptureTurns: target.estimatedCaptureTurns,
+        aggressionLabel: profile.label
       });
       return setStatus("sent", \`\${target.name || target.id}\`, { targetName: target.name || target.id, troops, strengthRatio: target.strengthRatio });
     }
@@ -5776,6 +5798,18 @@
         el.querySelectorAll("button[data-setting]").forEach((button) => {
           button.addEventListener("click", () => settings.set(button.dataset.setting, !settings.get(button.dataset.setting)));
         });
+        const AGG_LABELS = ["稳健", "均衡", "进取", "强攻", "全力"];
+        el.querySelectorAll("input[type='range'][data-setting]").forEach((input) => {
+          input.addEventListener("input", () => {
+            const val = Number(input.value);
+            settings.set(input.dataset.setting, val);
+            const valueEl = input.parentElement?.querySelector(".ofat-agg-value");
+            if (valueEl) {
+              valueEl.textContent = AGG_LABELS[Math.max(0, Math.min(4, val - 1))];
+              valueEl.dataset.agg = String(val);
+            }
+          });
+        });
       }
     };
   }
@@ -5796,7 +5830,11 @@
     html += actionPill("经济", ecoState, toneFromStatus(status.autoEco));
     html += actionPill("扩张", summarizeStatus(status.autoExpand, expansion), toneFromStatus(status.autoExpand));
     html += actionPill("农场", target ? target.label : summarizeStatus(status.autoFarm, "无"), target ? "ready" : toneFromStatus(status.autoFarm));
-    if (settings.get("autoAttack")) html += actionPill("进攻", summarizeStatus(status.autoAttack, "空闲"), toneFromStatus(status.autoAttack));
+    if (settings.get("autoAttack")) {
+      const aggLabel = getAggressionLabel(settings);
+      const atkSummary = summarizeStatus(status.autoAttack, "空闲");
+      html += actionPill(\`进攻[\${aggLabel}]\`, atkSummary, toneFromStatus(status.autoAttack));
+    }
     html += actionPill("防御", defenseSummary(status.autoDefense), status.autoDefense?.emergency ? "warn" : toneFromStatus(status.autoDefense));
     if (settings.get("autoBoat")) html += actionPill("登船", summarizeStatus(status.autoBoat, "空闲"), toneFromStatus(status.autoBoat));
     if (settings.get("autoWeapons")) html += actionPill("武器", weaponsSummary(status.autoWeapons), toneFromStatus(status.autoWeapons));
@@ -5804,6 +5842,15 @@
     html += actionPill("求救", summarizeStatus(status.quickChat, "空闲"), toneFromStatus(status.quickChat));
     html += actionPill("威胁", threat, threat === "安全" ? "ok" : "warn");
     html += \`</div>\`;
+    if (settings.get("autoAttack")) {
+      const aggLevel = Math.max(1, Math.min(5, Number(settings.get("autoAttackAggression")) || 2));
+      const aggLabels = ["稳健", "均衡", "进取", "强攻", "全力"];
+      html += \`<div class="ofat-action-row ofat-aggression-row">
+        <span class="ofat-agg-label">进攻强度</span>
+        <input type="range" class="ofat-agg-slider" data-setting="autoAttackAggression" min="1" max="5" step="1" value="\${aggLevel}">
+        <span class="ofat-agg-value" data-agg="\${aggLevel}">\${aggLabels[aggLevel - 1]}</span>
+      </div>\`;
+    }
     return html;
   }
   function actionToggle(settings, item) {
@@ -5894,6 +5941,49 @@
       #ofat-action-hud .ofat-action-pill[data-tone="ready"] { background: rgba(46, 125, 50, 0.68); }
       #ofat-action-hud .ofat-action-pill[data-tone="warn"] { background: rgba(183, 28, 28, 0.72); }
       #ofat-action-hud .ofat-action-pill[data-tone="cooldown"] { background: rgba(255, 190, 72, 0.35); }
+      #ofat-action-hud .ofat-aggression-row {
+        margin-top: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        justify-content: center;
+      }
+      #ofat-action-hud .ofat-agg-label {
+        color: rgba(244, 247, 251, 0.7);
+        white-space: nowrap;
+        font-size: 11px;
+      }
+      #ofat-action-hud .ofat-agg-slider {
+        -webkit-appearance: none;
+        appearance: none;
+        flex: 1;
+        max-width: 220px;
+        height: 4px;
+        border-radius: 999px;
+        background: linear-gradient(to right, #4caf50, #ff9800, #f44336);
+        outline: none;
+        cursor: pointer;
+      }
+      #ofat-action-hud .ofat-agg-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #f4f7fb;
+        border: 2px solid rgba(113, 191, 255, 0.8);
+        cursor: pointer;
+      }
+      #ofat-action-hud .ofat-agg-value {
+        min-width: 36px;
+        text-align: center;
+        font-weight: 700;
+        font-size: 11px;
+      }
+      #ofat-action-hud .ofat-agg-value[data-agg="1"] { color: #66bb6a; }
+      #ofat-action-hud .ofat-agg-value[data-agg="2"] { color: #aed581; }
+      #ofat-action-hud .ofat-agg-value[data-agg="3"] { color: #ffca28; }
+      #ofat-action-hud .ofat-agg-value[data-agg="4"] { color: #ffa726; }
+      #ofat-action-hud .ofat-agg-value[data-agg="5"] { color: #ef5350; }
     \`
     );
   }
@@ -6522,7 +6612,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.0",
+    version: "0.9.1",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -6585,7 +6675,8 @@
     autoExpand: true,
     autoAttack: false,
     autoAttackIncludeMark: false,
-    autoAttackCooldownMs: 3000
+    autoAttackCooldownMs: 3000,
+    autoAttackAggression: 2
   });
 
   // src/settings/settings-store.js
