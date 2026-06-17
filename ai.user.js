@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront Tactical Assistant
 // @namespace    https://github.com/local/openfront-script
-// @version      0.9.2
+// @version      0.9.3
 // @description  OpenFront 战术助手 — 出生/扩张/农场/自动进攻/防御/武器/联盟全自动，中文界面。
 // @license      MIT
 // @match        https://openfront.io/*
@@ -22,7 +22,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.2",
+    version: "0.9.3",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
@@ -247,25 +247,36 @@
     return style;
   }
   function makeDraggable(el, options = {}) {
-    const buttonSelector = options.ignoreSelector || "button";
+    const ignoreSelector = options.ignoreSelector || "button, input";
     let offsetX = 0;
     let offsetY = 0;
     let dragging = false;
+    el.style.cursor = "grab";
     el.addEventListener("mousedown", (event) => {
-      if (event.target && event.target.closest && event.target.closest(buttonSelector)) return;
+      if (event.target && event.target.closest && event.target.closest(ignoreSelector)) return;
       dragging = true;
+      // Convert from any positioning (bottom/right/transform) to explicit top/left
       const rect = el.getBoundingClientRect();
+      el.style.left = rect.left + "px";
+      el.style.top = rect.top + "px";
+      el.style.right = "auto";
+      el.style.bottom = "auto";
+      el.style.transform = "none";
       offsetX = event.clientX - rect.left;
       offsetY = event.clientY - rect.top;
+      el.style.cursor = "grabbing";
+      event.preventDefault();
     });
     document.addEventListener("mousemove", (event) => {
       if (!dragging) return;
-      el.style.left = \`\${Math.max(0, event.clientX - offsetX)}px\`;
-      el.style.top = \`\${Math.max(0, event.clientY - offsetY)}px\`;
-      el.style.right = "auto";
+      el.style.left = Math.max(0, event.clientX - offsetX) + "px";
+      el.style.top = Math.max(0, event.clientY - offsetY) + "px";
     });
     document.addEventListener("mouseup", () => {
-      dragging = false;
+      if (dragging) {
+        dragging = false;
+        el.style.cursor = "grab";
+      }
     });
   }
 
@@ -5849,6 +5860,7 @@
         el.id = "ofat-control-hud";
         appendWhenReady(el, "body");
         preventFocusSteal(el);
+        makeDraggable(el);
         this.render();
       },
       render() {
@@ -5942,7 +5954,9 @@
         color: #71c7ff;
         font-weight: 700;
         margin-bottom: 4px;
+        cursor: grab;
       }
+      #ofat-control-hud .ofat-hud-title:active { cursor: grabbing; }
       #ofat-control-hud .ofat-hud-title span {
         color: #f4f7fb;
       }
@@ -6031,6 +6045,7 @@
         el.id = "ofat-action-hud";
         appendWhenReady(el, "body");
         preventFocusSteal(el);
+        makeDraggable(el);
         this.render();
       },
       render() {
@@ -6061,7 +6076,8 @@
     const ecoState = economy ? \`\${economy.state} \${Math.round((economy.currentRatio || 0) * 100)}%\` : "空闲";
     const target = (vm?.farmRecommendations || []).find((rec) => rec.status === "farm") || null;
     const support = (vm?.teamSupportRecommendations || [])[0] || null;
-    let html = \`<div class="ofat-action-row ofat-action-toggles">\`;
+    let html = \`<div class="ofat-drag-handle">⠿ OF战术 ⠿</div>\`;
+    html += \`<div class="ofat-action-row ofat-action-toggles">\`;
     ACTION_SETTINGS.forEach((item) => {
       html += actionToggle(settings, item);
     });
@@ -6139,33 +6155,42 @@
         left: 50%;
         transform: translateX(-50%);
         z-index: 100001;
-        width: min(720px, calc(100vw - 24px));
-        padding: 8px;
+        width: min(660px, calc(100vw - 16px));
+        padding: 4px 6px 6px;
         color: #f4f7fb;
-        background: rgba(8, 10, 13, 0.9);
-        border: 1px solid rgba(255, 190, 72, 0.55);
-        border-radius: 8px;
-        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.32);
-        font: 12px/1.25 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+        background: rgba(8, 10, 13, 0.92);
+        border: 1px solid rgba(255, 190, 72, 0.45);
+        border-radius: 7px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+        font: 11px/1.2 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
         user-select: none;
       }
+      #ofat-action-hud .ofat-drag-handle {
+        text-align: center;
+        color: rgba(255, 255, 255, 0.22);
+        font-size: 9px;
+        letter-spacing: 3px;
+        padding: 1px 0 3px;
+        cursor: grab;
+      }
+      #ofat-action-hud .ofat-drag-handle:active { cursor: grabbing; }
       #ofat-action-hud .ofat-action-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 6px;
+        gap: 4px;
         align-items: center;
         justify-content: center;
       }
       #ofat-action-hud .ofat-action-state {
-        margin-top: 6px;
+        margin-top: 4px;
       }
       #ofat-action-hud button {
-        min-width: 72px;
-        height: 28px;
-        padding: 0 8px;
+        min-width: 54px;
+        height: 22px;
+        padding: 0 6px;
         color: #f4f7fb;
-        border: 1px solid rgba(255, 255, 255, 0.16);
-        border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 4px;
         background: rgba(255, 255, 255, 0.1);
         font: inherit;
         cursor: pointer;
@@ -6173,12 +6198,12 @@
       #ofat-action-hud button[data-tone="warn"] { background: rgba(183, 28, 28, 0.88); }
       #ofat-action-hud button[data-tone="on"] { background: rgba(46, 125, 50, 0.88); }
       #ofat-action-hud .ofat-action-pill {
-        max-width: 170px;
+        max-width: 140px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        padding: 3px 7px;
-        border-radius: 5px;
+        padding: 2px 5px;
+        border-radius: 4px;
         background: rgba(255, 255, 255, 0.1);
         color: rgba(244, 247, 251, 0.86);
       }
@@ -6186,23 +6211,23 @@
       #ofat-action-hud .ofat-action-pill[data-tone="warn"] { background: rgba(183, 28, 28, 0.72); }
       #ofat-action-hud .ofat-action-pill[data-tone="cooldown"] { background: rgba(255, 190, 72, 0.35); }
       #ofat-action-hud .ofat-aggression-row {
-        margin-top: 6px;
+        margin-top: 4px;
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
         justify-content: center;
       }
       #ofat-action-hud .ofat-agg-label {
-        color: rgba(244, 247, 251, 0.7);
+        color: rgba(244, 247, 251, 0.6);
         white-space: nowrap;
-        font-size: 11px;
+        font-size: 10px;
       }
       #ofat-action-hud .ofat-agg-slider {
         -webkit-appearance: none;
         appearance: none;
         flex: 1;
-        max-width: 220px;
-        height: 4px;
+        max-width: 180px;
+        height: 3px;
         border-radius: 999px;
         background: linear-gradient(to right, #4caf50, #ff9800, #f44336);
         outline: none;
@@ -6210,18 +6235,18 @@
       }
       #ofat-action-hud .ofat-agg-slider::-webkit-slider-thumb {
         -webkit-appearance: none;
-        width: 14px;
-        height: 14px;
+        width: 12px;
+        height: 12px;
         border-radius: 50%;
         background: #f4f7fb;
         border: 2px solid rgba(113, 191, 255, 0.8);
         cursor: pointer;
       }
       #ofat-action-hud .ofat-agg-value {
-        min-width: 36px;
+        min-width: 30px;
         text-align: center;
         font-weight: 700;
-        font-size: 11px;
+        font-size: 10px;
       }
       #ofat-action-hud .ofat-agg-value[data-agg="1"] { color: #66bb6a; }
       #ofat-action-hud .ofat-agg-value[data-agg="2"] { color: #aed581; }
@@ -6856,7 +6881,7 @@
   var APP = Object.freeze({
     name: "OpenFront Tactical Assistant",
     shortName: "OF Tactical",
-    version: "0.9.2",
+    version: "0.9.3",
     modified: "2026-06-17",
     storageKey: "ofat.settings.v1",
     pagePayloadKey: "__OFAT_PAGE_PAYLOAD__",
